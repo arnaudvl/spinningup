@@ -7,6 +7,7 @@ from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_tf import MpiAdamOptimizer, sync_all_params
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
 
+from spinup.algos.ppo.utils import preprocess_obs
 
 class PPOBuffer:
     """
@@ -89,10 +90,10 @@ Proximal Policy Optimization (by clipping),
 with early stopping based on approximate KL
 
 """
-def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0, 
+def ppo(env_fn, actor_critic=core.cnn_actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
-        target_kl=0.01, logger_kwargs=dict(), save_freq=10):
+        target_kl=0.01, logger_kwargs=dict(), save_freq=10, preprocess_kwargs=dict()):
     """
 
     Args:
@@ -162,6 +163,9 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
+        
+        preprocess_kwargs (dict): Any kwargs appropriate for the observation 
+            preprocessing function from utils.py.
 
     """
 
@@ -171,20 +175,41 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
     seed += 10000 * proc_id()
     tf.set_random_seed(seed)
     np.random.seed(seed)
-
+    
+    # set up environment
     env = env_fn()
-    obs_dim = env.observation_space.shape
+    
+    # sample env and preprocess obs to determine obs dim and get action dim
+    o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+    preprocess_kwargs['obs_old'] = None
+    obs = preprocess_obs(o,**preprocess_kwargs)
+    obs_dim = obs.shape
     act_dim = env.action_space.shape
+    
+    print('Observation dim: {}'.format(obs_dim))
+    print('Action dim: {}'.format(act_dim))
     
     # Share information about action space with policy architecture
     ac_kwargs['action_space'] = env.action_space
 
     # Inputs to computation graph
-    x_ph, a_ph = core.placeholders_from_spaces(env.observation_space, env.action_space)
+    obs_space = gym.spaces.box.Box(0, 255, list(obs_dim),dtype='int32') # only shape important
+    x_ph, a_ph = core.placeholders_from_spaces(obs_space, env.action_space)
     adv_ph, ret_ph, logp_old_ph = core.placeholders(None, None, None)
+    
+    print('Obs ph: {}'.format(x_ph.get_shape()))
+    print('Act ph: {}'.format(a_ph.get_shape()))
+    print('Adv ph: {}'.format(adv_ph.get_shape()))
+    print('Ret ph: {}'.format(ret_ph.get_shape()))
+    print('Logp old ph: {}'.format(logp_old_ph.get_shape()))
 
     # Main outputs from computation graph
     pi, logp, logp_pi, v = actor_critic(x_ph, a_ph, **ac_kwargs)
+    
+    print('pi: {}'.format(pi.get_shape()))
+    print('logp: {}'.format(logp.get_shape()))
+    print('logp pi: {}'.format(logp_pi.get_shape()))
+    print('v: {}'.format(v.get_shape()))
 
     # Need all placeholders in *this* order later (to zip with data from buffer)
     all_phs = [x_ph, a_ph, adv_ph, ret_ph, logp_old_ph]
@@ -205,6 +230,11 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
     min_adv = tf.where(adv_ph>0, (1+clip_ratio)*adv_ph, (1-clip_ratio)*adv_ph)
     pi_loss = -tf.reduce_mean(tf.minimum(ratio * adv_ph, min_adv))
     v_loss = tf.reduce_mean((ret_ph - v)**2)
+    
+    print('ratio: {}'.format(ratio.get_shape()))
+    print('min_adv: {}'.format(min_adv.get_shape()))
+    print('pi_loss: {}'.format(pi_loss.get_shape()))
+    print('v_loss: {}'.format(v_loss.get_shape()))
 
     # Info (useful to watch during learning)
     approx_kl = tf.reduce_mean(logp_old_ph - logp)      # a sample estimate for KL-divergence, easy to compute
@@ -218,6 +248,9 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
     sess = tf.Session()
     sess.run(tf.global_variables_initializer())
+    
+    # Tensorboard
+    summary_writer = tf.summary.FileWriter(logger_kwargs['output_dir'],tf.get_default_graph())
 
     # Sync params across processes
     sess.run(sync_all_params())
@@ -249,31 +282,49 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
     start_time = time.time()
     o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+    
+    # obs preprocessing: optional gray- and minmax scaling, cropping and tracing frames
+    preprocess_kwargs['obs_old'] = None
+    obs = preprocess_obs(o,**preprocess_kwargs)
 
     # Main loop: collect experience in env and update/log each epoch
     for epoch in range(epochs):
         for t in range(local_steps_per_epoch):
-            a, v_t, logp_t = sess.run(get_action_ops, feed_dict={x_ph: o.reshape(1,-1)})
+            
+            a, v_t, logp_t = sess.run(get_action_ops, feed_dict={x_ph: obs[np.newaxis,...]})
 
             # save and log
-            buf.store(o, a, r, v_t, logp_t)
+            buf.store(obs, a, r, v_t, logp_t)
             logger.store(VVals=v_t)
-
+            
+            # take step in environment
+            #print(a[0])
             o, r, d, _ = env.step(a[0])
+            #o, r, d, _ = env.step(env.action_space.sample())
+            
             ep_ret += r
             ep_len += 1
+            
+            # obs preprocessing
+            preprocess_kwargs['obs_old'] = obs
+            obs = preprocess_obs(o,**preprocess_kwargs)
 
             terminal = d or (ep_len == max_ep_len)
             if terminal or (t==local_steps_per_epoch-1):
                 if not(terminal):
                     print('Warning: trajectory cut off by epoch at %d steps.'%ep_len)
                 # if trajectory didn't reach terminal state, bootstrap value target
-                last_val = r if d else sess.run(v, feed_dict={x_ph: o.reshape(1,-1)})
+                last_val = r if d else sess.run(v, feed_dict={x_ph: obs[np.newaxis,...]})
                 buf.finish_path(last_val)
-                if terminal:
-                    # only save EpRet / EpLen if trajectory finished
-                    logger.store(EpRet=ep_ret, EpLen=ep_len)
+                logger.store(EpRet=ep_ret, EpLen=ep_len)
+                #if terminal:
+                #    # only save EpRet / EpLen if trajectory finished
+                #    logger.store(EpRet=ep_ret, EpLen=ep_len)
                 o, r, d, ep_ret, ep_len = env.reset(), 0, False, 0, 0
+                
+                # obs preprocessing from scratch
+                preprocess_kwargs['obs_old'] = None
+                obs = preprocess_obs(o,**preprocess_kwargs)
 
         # Save model
         if (epoch % save_freq == 0) or (epoch == epochs-1):
@@ -281,6 +332,22 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
 
         # Perform PPO update!
         update()
+        
+        # Update tensorboard
+        log_perf_board = ['EpRet','EpLen','VVals']
+        log_loss_board = ['LossPi','LossV','DeltaLossPi','DeltaLossV','Entropy','KL','ClipFrac']
+        log_board = {'Performance': log_perf_board, 'Loss': log_loss_board}
+        summary = tf.Summary()
+        for key,value in log_board.items():
+            for val in value:
+                mean, std = logger.get_stats(val)
+                if key=='Performance':
+                    summary.value.add(tag=key+'/Average'+val, simple_value=mean)
+                    summary.value.add(tag=key+'/Std'+val, simple_value=std)
+                else:
+                    summary.value.add(tag=key+'/'+val, simple_value=mean)
+        summary_writer.add_summary(summary, epoch)
+        summary_writer.flush()
 
         # Log info about epoch
         logger.log_tabular('Epoch', epoch)
@@ -298,27 +365,49 @@ def ppo(env_fn, actor_critic=core.mlp_actor_critic, ac_kwargs=dict(), seed=0,
         logger.log_tabular('StopIter', average_only=True)
         logger.log_tabular('Time', time.time()-start_time)
         logger.dump_tabular()
-
+        
+    
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', type=str, default='HalfCheetah-v2')
-    parser.add_argument('--hid', type=int, default=64)
-    parser.add_argument('--l', type=int, default=2)
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--seed', '-s', type=int, default=0)
-    parser.add_argument('--cpu', type=int, default=4)
-    parser.add_argument('--steps', type=int, default=4000)
-    parser.add_argument('--epochs', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='ppo')
+    parser.add_argument('--seed', '-s', type=int, default=0)
+    parser.add_argument('--steps_per_epoch', type=int, default=4000)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--clip_ratio', type=float, default=0.2)
+    parser.add_argument('--pi_lr', type=float, default=0.0003)
+    parser.add_argument('--vf_lr', type=float, default=0.001)
+    parser.add_argument('--train_pi_iters', type=int, default=80)
+    parser.add_argument('--train_v_iters', type=int, default=80)
+    parser.add_argument('--lam', type=float, default=0.97)
+    parser.add_argument('--max_ep_len', type=int, default=1000)
+    parser.add_argument('--target_kl', type=float, default=0.01)
+    parser.add_argument('--save_freq', type=int, default=10)
+    parser.add_argument('--cpu', type=int, default=4)
+    parser.add_argument('--hidden_sizes',type=int,nargs='+',default=[64,64])
     args = parser.parse_args()
-
+    
     mpi_fork(args.cpu)  # run parallel code with mpi
 
     from spinup.utils.run_utils import setup_logger_kwargs
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
-    ppo(lambda : gym.make(args.env), actor_critic=core.mlp_actor_critic,
-        ac_kwargs=dict(hidden_sizes=[args.hid]*args.l), gamma=args.gamma, 
-        seed=args.seed, steps_per_epoch=args.steps, epochs=args.epochs,
+    ppo(lambda : gym.make(args.env), 
+        actor_critic=core.mlp_actor_critic,
+        ac_kwargs=dict(hidden_sizes=args.hidden_sizes),
+        seed=args.seed,
+        steps_per_epoch=args.steps_per_epoch,
+        epochs=args.epochs,
+        gamma=args.gamma, 
+        clip_ratio=args.clip_ratio,
+        pi_lr=args.pi_lr,
+        vf_lr=args.vf_lr,
+        train_pi_iters=args.train_pi_iters,
+        train_v_iters=args.train_v_iters,
+        lam=args.lam,
+        max_ep_len=args.max_ep_len,
+        target_kl=args.target_kl,
+        save_freq=args.save_freq,
         logger_kwargs=logger_kwargs)

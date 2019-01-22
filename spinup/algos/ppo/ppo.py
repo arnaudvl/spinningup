@@ -2,12 +2,13 @@ import numpy as np
 import tensorflow as tf
 import gym
 import time
-import spinup.algos.ppo.core as core
+
+from spinup.algos.ppo.actor_critic import mlp_actor_critic, lstm_actor_critic, cnn_actor_critic
+from spinup.algos.ppo.utils import combined_shape, discount_cumsum, placeholders_from_spaces, \
+                                   placeholders, count_vars, preprocess_obs
 from spinup.utils.logx import EpochLogger
 from spinup.utils.mpi_tf import MpiAdamOptimizer, sync_all_params
 from spinup.utils.mpi_tools import mpi_fork, mpi_avg, proc_id, mpi_statistics_scalar, num_procs
-
-from spinup.algos.ppo.utils import preprocess_obs
 
 class PPOBuffer:
     """
@@ -17,8 +18,8 @@ class PPOBuffer:
     """
 
     def __init__(self, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
-        self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
-        self.act_buf = np.zeros(core.combined_shape(size, act_dim), dtype=np.float32)
+        self.obs_buf = np.zeros(combined_shape(size, obs_dim), dtype=np.float32)
+        self.act_buf = np.zeros(combined_shape(size, act_dim), dtype=np.float32)
         self.adv_buf = np.zeros(size, dtype=np.float32)
         self.rew_buf = np.zeros(size, dtype=np.float32)
         self.ret_buf = np.zeros(size, dtype=np.float32)
@@ -61,10 +62,10 @@ class PPOBuffer:
         
         # the next two lines implement GAE-Lambda advantage calculation
         deltas = rews[:-1] + self.gamma * vals[1:] - vals[:-1]
-        self.adv_buf[path_slice] = core.discount_cumsum(deltas, self.gamma * self.lam)
+        self.adv_buf[path_slice] = discount_cumsum(deltas, self.gamma * self.lam)
         
         # the next line computes rewards-to-go, to be targets for the value function
-        self.ret_buf[path_slice] = core.discount_cumsum(rews, self.gamma)[:-1]
+        self.ret_buf[path_slice] = discount_cumsum(rews, self.gamma)[:-1]
         
         self.path_start_idx = self.ptr
 
@@ -90,7 +91,7 @@ Proximal Policy Optimization (by clipping),
 with early stopping based on approximate KL
 
 """
-def ppo(env_fn, actor_critic=core.cnn_actor_critic, ac_kwargs=dict(), seed=0, 
+def ppo(env_fn, actor_critic=cnn_actor_critic, ac_kwargs=dict(), seed=0, 
         steps_per_epoch=4000, epochs=50, gamma=0.99, clip_ratio=0.2, pi_lr=3e-4,
         vf_lr=1e-3, train_pi_iters=80, train_v_iters=80, lam=0.97, max_ep_len=1000,
         target_kl=0.01, logger_kwargs=dict(), save_freq=10, preprocess_kwargs=dict()):
@@ -186,26 +187,29 @@ def ppo(env_fn, actor_critic=core.cnn_actor_critic, ac_kwargs=dict(), seed=0,
     obs_dim = obs.shape
     act_dim = env.action_space.shape
     
-    print('Observation dim: {}'.format(obs_dim))
-    print('Action dim: {}'.format(act_dim))
+    print('\nEnvironment dimensions:')
+    print('Observation: {}'.format(obs_dim))
+    print('Action: {}'.format(act_dim))
     
     # Share information about action space with policy architecture
     ac_kwargs['action_space'] = env.action_space
 
     # Inputs to computation graph
     obs_space = gym.spaces.box.Box(0, 255, list(obs_dim),dtype='int32') # only shape important
-    x_ph, a_ph = core.placeholders_from_spaces(obs_space, env.action_space)
-    adv_ph, ret_ph, logp_old_ph = core.placeholders(None, None, None)
+    x_ph, a_ph = placeholders_from_spaces(obs_space, env.action_space)
+    adv_ph, ret_ph, logp_old_ph = placeholders(None, None, None)
     
-    print('Obs ph: {}'.format(x_ph.get_shape()))
-    print('Act ph: {}'.format(a_ph.get_shape()))
-    print('Adv ph: {}'.format(adv_ph.get_shape()))
-    print('Ret ph: {}'.format(ret_ph.get_shape()))
-    print('Logp old ph: {}'.format(logp_old_ph.get_shape()))
+    print('\nPlaceholder dimensions:')
+    print('Obs: {}'.format(x_ph.get_shape()))
+    print('Act: {}'.format(a_ph.get_shape()))
+    print('Adv: {}'.format(adv_ph.get_shape()))
+    print('Ret: {}'.format(ret_ph.get_shape()))
+    print('Logp old: {}'.format(logp_old_ph.get_shape()))
 
     # Main outputs from computation graph
     pi, logp, logp_pi, v = actor_critic(x_ph, a_ph, **ac_kwargs)
     
+    print('\nPlaceholder dimensions:')
     print('pi: {}'.format(pi.get_shape()))
     print('logp: {}'.format(logp.get_shape()))
     print('logp pi: {}'.format(logp_pi.get_shape()))
@@ -222,7 +226,7 @@ def ppo(env_fn, actor_critic=core.cnn_actor_critic, ac_kwargs=dict(), seed=0,
     buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
 
     # Count variables
-    var_counts = tuple(core.count_vars(scope) for scope in ['pi', 'v'])
+    var_counts = tuple(count_vars(scope) for scope in ['pi', 'v'])
     logger.log('\nNumber of parameters: \t pi: %d, \t v: %d\n'%var_counts)
 
     # PPO objectives
@@ -231,10 +235,11 @@ def ppo(env_fn, actor_critic=core.cnn_actor_critic, ac_kwargs=dict(), seed=0,
     pi_loss = -tf.reduce_mean(tf.minimum(ratio * adv_ph, min_adv))
     v_loss = tf.reduce_mean((ret_ph - v)**2)
     
+    print('\nPPO objective dimensions:')
     print('ratio: {}'.format(ratio.get_shape()))
-    print('min_adv: {}'.format(min_adv.get_shape()))
-    print('pi_loss: {}'.format(pi_loss.get_shape()))
-    print('v_loss: {}'.format(v_loss.get_shape()))
+    print('min adv: {}'.format(min_adv.get_shape()))
+    print('pi loss: {}'.format(pi_loss.get_shape()))
+    print('v loss: {}'.format(v_loss.get_shape()))
 
     # Info (useful to watch during learning)
     approx_kl = tf.reduce_mean(logp_old_ph - logp)      # a sample estimate for KL-divergence, easy to compute
@@ -300,7 +305,7 @@ def ppo(env_fn, actor_critic=core.cnn_actor_critic, ac_kwargs=dict(), seed=0,
             # take step in environment
             #print(a[0])
             o, r, d, _ = env.step(a[0])
-            #o, r, d, _ = env.step(env.action_space.sample())
+            #o, r, d, _ = env.step(env.action_space.sample()) # random action
             
             ep_ret += r
             ep_len += 1
@@ -395,7 +400,7 @@ if __name__ == '__main__':
     logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed)
 
     ppo(lambda : gym.make(args.env), 
-        actor_critic=core.mlp_actor_critic,
+        actor_critic=mlp_actor_critic,
         ac_kwargs=dict(hidden_sizes=args.hidden_sizes),
         seed=args.seed,
         steps_per_epoch=args.steps_per_epoch,
